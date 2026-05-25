@@ -1,0 +1,1110 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Inyector de Audio Espacial 3D — Prototipo Técnico</title>
+
+<!--
+  ============================================================================
+  PROTOTIPO: BUSCAR EN FREESOUND -> PREESCUCHAR -> INYECTAR EN ESPACIO 3D
+  ----------------------------------------------------------------------------
+  Arquitectura de subsistemas (todos en este único archivo):
+    [A] CONFIG        -> token, constantes y banco de failsafe.
+    [B] FREESOUND     -> búsqueda contra la API (con fallback robusto).
+    [C] UI / LISTA    -> render de resultados, flujo Preview & Inject.
+    [D] AUDIO ENGINE  -> AudioContext, grafo de nodos, espacialización.
+    [E] SCENE 3D      -> Three.js: cubo wireframe + nodos sonoros neón.
+    [F] CAMARA        -> mirada en primera persona (drag mouse/táctil).
+    [G] MEMORIA       -> límite estricto de 5 nodos (destrucción FIFO).
+  ============================================================================
+-->
+
+<style>
+  /* ---------- [ESTILO] Modo oscuro técnico ---------- */
+  :root {
+    --bg:         #0a0c10;
+    --panel:      #12161d;
+    --panel-2:    #171c25;
+    --border:     #232b38;
+    --txt:        #c7d0dc;
+    --txt-dim:    #6c7787;
+    --accent:     #00e5ff;
+    --accent-2:   #ff2bd6;
+    --ok:         #39ff7a;
+    --warn:       #ffd23f;
+    --danger:     #ff4d5e;
+    --mono: "SF Mono", "Consolas", "Roboto Mono", ui-monospace, monospace;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    height: 100%;
+    background: var(--bg);
+    color: var(--txt);
+    font-family: var(--mono);
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
+  /* Lienzo 3D ocupa toda la ventana, como fondo */
+  #scene-canvas {
+    position: fixed;
+    inset: 0;
+    z-index: 0;
+    display: block;
+    touch-action: none; /* permite capturar gestos de arrastre sin scroll */
+  }
+
+  /* Panel de control flotante sobre la escena */
+  #control-panel {
+    position: fixed;
+    top: 12px;
+    left: 12px;
+    z-index: 10;
+    width: min(380px, calc(100vw - 24px));
+    max-height: calc(100vh - 24px);
+    display: flex;
+    flex-direction: column;
+    background: rgba(18, 22, 29, 0.92);
+    backdrop-filter: blur(8px);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+  }
+
+  .panel-header {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(90deg, var(--panel-2), var(--panel));
+  }
+  .panel-header h1 {
+    font-size: 13px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .panel-header p {
+    margin-top: 4px;
+    font-size: 10px;
+    color: var(--txt-dim);
+    line-height: 1.4;
+  }
+
+  /* Buscador */
+  .search-zone {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .search-row { display: flex; gap: 8px; }
+
+  #search-input {
+    flex: 1;
+    min-width: 0;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--txt);
+    padding: 9px 11px;
+    border-radius: 6px;
+    font-family: var(--mono);
+    font-size: 12px;
+    outline: none;
+    transition: border-color 0.15s;
+  }
+  #search-input:focus { border-color: var(--accent); }
+
+  button {
+    font-family: var(--mono);
+    cursor: pointer;
+    border: none;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    transition: filter 0.15s, transform 0.05s;
+  }
+  button:active { transform: scale(0.97); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  #search-btn {
+    background: var(--accent);
+    color: #001417;
+    padding: 9px 12px;
+    white-space: nowrap;
+    text-transform: uppercase;
+  }
+  #search-btn:hover:not(:disabled) { filter: brightness(1.15); }
+
+  /* Indicador de token */
+  .token-status {
+    font-size: 10px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    display: inline-block;
+    width: fit-content;
+  }
+  .token-status.ok   { background: rgba(57,255,122,0.12); color: var(--ok); }
+  .token-status.warn { background: rgba(255,210,63,0.12); color: var(--warn); }
+
+  /* Lista de resultados */
+  .results-zone {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 10px;
+    min-height: 60px;
+  }
+  .results-zone::-webkit-scrollbar { width: 6px; }
+  .results-zone::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  .status-line {
+    font-size: 11px;
+    color: var(--txt-dim);
+    padding: 8px 4px;
+    line-height: 1.5;
+  }
+
+  .result-item {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 9px 10px;
+    margin-bottom: 7px;
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    animation: slideIn 0.2s ease;
+  }
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .result-item.removing {
+    animation: slideOut 0.2s ease forwards;
+  }
+  @keyframes slideOut {
+    to { opacity: 0; transform: translateX(20px); height: 0; padding: 0; margin: 0; }
+  }
+
+  .result-title {
+    font-size: 11px;
+    color: var(--txt);
+    line-height: 1.35;
+    word-break: break-word;
+  }
+  .result-meta { font-size: 9px; color: var(--txt-dim); }
+
+  .result-actions { display: flex; gap: 6px; }
+
+  .btn-preview {
+    flex: 1;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--txt);
+    padding: 7px 8px;
+  }
+  .btn-preview:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-preview.playing {
+    border-color: var(--warn);
+    color: var(--warn);
+    background: rgba(255,210,63,0.08);
+  }
+
+  .btn-inject {
+    flex: 1;
+    background: linear-gradient(135deg, var(--accent-2), #b300a0);
+    color: #fff;
+    padding: 7px 8px;
+  }
+  .btn-inject:hover { filter: brightness(1.15); }
+
+  /* HUD inferior: contador de nodos y ayuda */
+  #hud {
+    position: fixed;
+    bottom: 12px;
+    left: 12px;
+    z-index: 10;
+    background: rgba(18, 22, 29, 0.85);
+    backdrop-filter: blur(6px);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-size: 10px;
+    color: var(--txt-dim);
+    line-height: 1.6;
+    pointer-events: none;
+  }
+  #node-counter { color: var(--accent); font-weight: 600; }
+  #hud .key { color: var(--txt); }
+
+  /* Aviso de "toca para iniciar audio" (política de autoplay) */
+  #audio-gate {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(5,7,10,0.85);
+    backdrop-filter: blur(4px);
+    cursor: pointer;
+  }
+  #audio-gate .gate-card {
+    text-align: center;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    padding: 28px 36px;
+    border-radius: 12px;
+  }
+  #audio-gate h2 { color: var(--accent); font-size: 16px; letter-spacing: 0.05em; }
+  #audio-gate p  { color: var(--txt-dim); font-size: 12px; margin-top: 10px; }
+  .pulse { animation: pulse 1.6s infinite; }
+  @keyframes pulse { 0%,100%{opacity:1;} 50%{opacity:0.45;} }
+</style>
+</head>
+<body>
+
+  <!-- Lienzo donde Three.js dibuja la escena 3D -->
+  <canvas id="scene-canvas"></canvas>
+
+  <!-- Compuerta de audio: el navegador exige un gesto del usuario para iniciar AudioContext -->
+  <div id="audio-gate">
+    <div class="gate-card">
+      <h2 class="pulse">▶ TOCA PARA INICIAR</h2>
+      <p>El navegador requiere un gesto del usuario<br>para habilitar el motor de audio espacial.</p>
+    </div>
+  </div>
+
+  <!-- Panel de control: buscador + lista de resultados -->
+  <div id="control-panel">
+    <div class="panel-header">
+      <h1>◈ Inyector de Audio Espacial</h1>
+      <p>Busca → Preescucha → Inyecta en el cubo 10×10×10</p>
+    </div>
+
+    <div class="search-zone">
+      <div class="search-row">
+        <input id="search-input" type="text" placeholder="ej: rain, wind, ambient..." value="ambient">
+        <button id="search-btn">Buscar en Freesound</button>
+      </div>
+      <span id="token-status" class="token-status warn">● Token: comprobando…</span>
+    </div>
+
+    <div class="results-zone" id="results-zone">
+      <div class="status-line">Introduce un término y pulsa buscar. Sin token o sin red se usará el banco failsafe local.</div>
+    </div>
+  </div>
+
+  <!-- HUD inferior -->
+  <div id="hud">
+    Nodos activos: <span id="node-counter">0 / 5</span><br>
+    <span class="key">Arrastra</span> para girar la mirada · el audio se espacializa en vivo
+  </div>
+
+  <!-- Three.js (r128) desde CDN permitido -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+  <script>
+  "use strict";
+
+  /* ==========================================================================
+     [A] CONFIGURACIÓN GLOBAL
+     ========================================================================== */
+
+  // >>> PEGA AQUÍ TU CREDENCIAL DE LA API DE FREESOUND <<<
+  // Déjala vacía ('') para forzar el modo failsafe local.
+  const FREESOUND_TOKEN = 'TU_TOKEN_AQUÍ';
+
+  // Endpoint de búsqueda por texto de la API v2 de Freesound.
+  const FREESOUND_API = 'https://freesound.org/apiv2/search/text/';
+
+  // Parámetros del entorno espacial.
+  const CUBE_SIZE   = 10;          // Cubo de 10×10×10 unidades.
+  const HALF        = CUBE_SIZE / 2;
+  const MAX_NODES   = 5;           // [Req. 7] Límite estricto de concurrencia.
+  const SPAWN_MARGIN = 0.6;        // Margen para que los nodos no toquen las paredes.
+
+  // Paleta neón [Req. 4].
+  const NEON_COLORS = [0x00e5ff, 0xff2bd6, 0x9dff00, 0xffe000];
+
+  // [Req. 8] Banco failsafe SINTÉTICO — verdaderamente a prueba de fallos.
+  // --------------------------------------------------------------------------
+  // En lugar de depender de URLs remotas (que se caen, cambian o bloquean CORS),
+  // generamos los ambientes por código y los codificamos como Data URLs WAV.
+  // Resultado: 100% offline, sin red, sin token, sin CORS. El resto del código
+  // los trata como cualquier otra URL de audio, así que nada más cambia.
+  //
+  // El array se rellena en SynthBank.build() durante el arranque.
+  const FAILSAFE_BANK = [];
+
+  // Recetas de cada ambiente: tipo de ruido + filtrado que lo caracteriza.
+  const SYNTH_RECIPES = [
+    { name: 'Viento ambiente',   type: 'wind' },
+    { name: 'Lluvia suave',      type: 'rain' },
+    { name: 'Grillos nocturnos', type: 'crickets' },
+    { name: 'Arroyo de agua',    type: 'water' },
+    { name: 'Fuego crepitante',  type: 'fire' }
+  ];
+
+  /* ==========================================================================
+     BANCO SINTÉTICO — genera ruido ambiental y lo empaqueta como WAV Data URL
+     --------------------------------------------------------------------------
+     Cada clip dura unos segundos y está pensado para reproducirse en bucle.
+     Sintetizamos las muestras a mano y escribimos un WAV PCM de 16 bits que el
+     navegador reproduce como <audio src="data:audio/wav;base64,...">.
+     ========================================================================== */
+  const SynthBank = {
+    SAMPLE_RATE: 22050,   // suficiente para ambientes; mitad de memoria.
+    DURATION: 2,          // segundos por clip (se reproduce en loop).
+
+    // Construye todos los clips y rellena FAILSAFE_BANK.
+    build() {
+      console.log('[SYNTHBANK] Generando', SYNTH_RECIPES.length, 'ambientes sintéticos...');
+      const start = Date.now();
+      
+      for (const recipe of SYNTH_RECIPES) {
+        const samples = this._synthesize(recipe.type);
+        const url = this._encodeWav(samples);
+        FAILSAFE_BANK.push({ name: recipe.name, url: url });
+        console.log('[SYNTHBANK]', recipe.name, '-', (url.length / 1024).toFixed(1), 'KB');
+      }
+      
+      const elapsed = Date.now() - start;
+      console.log('[SYNTHBANK] Completado en', elapsed, 'ms');
+    },
+
+    // Genera el array de muestras [-1, 1] según el tipo de ambiente.
+    _synthesize(type) {
+      const sr = this.SAMPLE_RATE;
+      const n  = sr * this.DURATION;
+      const out = new Float32Array(n);
+
+      let lp = 0; // estado del filtro paso bajo de un polo.
+
+      for (let i = 0; i < n; i++) {
+        const t = i / sr;
+        const white = Math.random() * 2 - 1;   // ruido blanco base.
+        let s = 0;
+
+        switch (type) {
+          case 'wind': {
+            // Paso bajo fuerte + modulación lenta de amplitud (ráfagas).
+            lp += (white - lp) * 0.04;
+            const gust = 0.5 + 0.5 * Math.sin(t * 0.6) * Math.sin(t * 0.23);
+            s = lp * 3.0 * gust;
+            break;
+          }
+          case 'rain': {
+            // Ruido de banda alta + gotas aleatorias.
+            lp += (white - lp) * 0.5;
+            const drop = (Math.random() < 0.02) ? (Math.random() * 2 - 1) : 0;
+            s = (white - lp) * 0.5 + drop * 0.6;
+            break;
+          }
+          case 'crickets': {
+            // Portadora aguda pulsada en ráfagas rítmicas.
+            const carrier = Math.sin(2 * Math.PI * 4200 * t);
+            const trill   = Math.sin(2 * Math.PI * 40 * t) > 0.6 ? 1 : 0;
+            const env     = (Math.sin(t * 2.0) > 0 ? 1 : 0);
+            s = carrier * trill * env * 0.25 + white * 0.02;
+            break;
+          }
+          case 'water': {
+            // Paso bajo medio + ondulación de varias frecuencias (borboteo).
+            lp += (white - lp) * 0.15;
+            const bubble = Math.sin(t * 3.1) * Math.sin(t * 7.7) * 0.3;
+            s = lp * 1.8 + bubble * lp * 2.0;
+            break;
+          }
+          case 'fire': {
+            // Zumbido grave + chasquidos aleatorios cortos (crepitar).
+            lp += (white - lp) * 0.08;
+            const crackle = (Math.random() < 0.008) ? (Math.random() * 2 - 1) * 0.9 : 0;
+            s = lp * 1.5 + crackle;
+            break;
+          }
+          default:
+            s = white * 0.3;
+        }
+
+        out[i] = Math.max(-1, Math.min(1, s)); // recorte de seguridad.
+      }
+
+      // Fundido de entrada/salida para que el loop no produzca un "clic".
+      const fade = Math.floor(sr * 0.05);
+      for (let i = 0; i < fade; i++) {
+        const g = i / fade;
+        out[i] *= g;
+        out[n - 1 - i] *= g;
+      }
+      return out;
+    },
+
+    // Codifica las muestras Float32 como WAV PCM 16-bit y devuelve un Data URL.
+    _encodeWav(samples) {
+      const sr = this.SAMPLE_RATE;
+      const numSamples = samples.length;
+      const buffer = new ArrayBuffer(44 + numSamples * 2);
+      const view = new DataView(buffer);
+
+      const writeStr = (offset, str) => {
+        for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+      };
+      // Cabecera WAV estándar (mono, 16-bit PCM).
+      writeStr(0, 'RIFF');
+      view.setUint32(4, 36 + numSamples * 2, true);
+      writeStr(8, 'WAVE');
+      writeStr(12, 'fmt ');
+      view.setUint32(16, 16, true);          // tamaño del subchunk fmt.
+      view.setUint16(20, 1, true);           // formato PCM.
+      view.setUint16(22, 1, true);           // mono.
+      view.setUint32(24, sr, true);          // sample rate.
+      view.setUint32(28, sr * 2, true);      // byte rate.
+      view.setUint16(32, 2, true);           // block align.
+      view.setUint16(34, 16, true);          // bits por muestra.
+      writeStr(36, 'data');
+      view.setUint32(40, numSamples * 2, true);
+
+      let offset = 44;
+      for (let i = 0; i < numSamples; i++) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        offset += 2;
+      }
+
+      // Uint8Array -> base64 de forma robusta (sin apply que puede fallar).
+      const bytes = new Uint8Array(buffer);
+      const base64chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+      let base64 = '';
+      
+      for (let i = 0; i < bytes.length; i += 3) {
+        const b1 = bytes[i];
+        const b2 = i + 1 < bytes.length ? bytes[i + 1] : 0;
+        const b3 = i + 2 < bytes.length ? bytes[i + 2] : 0;
+        
+        const enc1 = b1 >> 2;
+        const enc2 = ((b1 & 3) << 4) | (b2 >> 4);
+        const enc3 = ((b2 & 15) << 2) | (b3 >> 6);
+        const enc4 = b3 & 63;
+        
+        base64 += base64chars[enc1] + base64chars[enc2];
+        base64 += (i + 1 < bytes.length) ? base64chars[enc3] : '=';
+        base64 += (i + 2 < bytes.length) ? base64chars[enc4] : '=';
+      }
+      
+      return 'data:audio/wav;base64,' + base64;
+    }
+  };
+
+  /* ==========================================================================
+     [D] MOTOR DE AUDIO — núcleo de Web Audio API
+     --------------------------------------------------------------------------
+     Mantenemos el grafo a mano (en lugar de Three.PositionalAudio) para tener
+     control explícito sobre crossOrigin, PannerNode y .disconnect() — esencial
+     para el manejo estricto de memoria del requisito 7.
+     ========================================================================== */
+
+  const AudioEngine = {
+    ctx: null,
+    listener: null,
+    ready: false,
+
+    // Inicializa el AudioContext tras el gesto del usuario.
+    init() {
+      if (this.ctx) return;
+      const AC = window.AudioContext || window.webkitAudioContext;
+      this.ctx = new AC();
+      this.listener = this.ctx.listener;
+      this.ready = true;
+    },
+
+    // Construye un nodo sonoro espacializado a partir de una URL.
+    // Devuelve { audioEl, source, panner, gain } o null si falla.
+    createSpatialSource(url, x, y, z) {
+      const ctx = this.ctx;
+
+      // Elemento <audio> como fuente de streaming (no descargamos el buffer
+      // completo: mejor para memoria en gama baja).
+      const audioEl = new Audio();
+      // [Req. 5] crossOrigin SOLO para audio remoto (Freesound). Para los Data
+      // URLs sintéticos locales no aplica y en algunos navegadores estorba.
+      if (/^https?:/i.test(url)) audioEl.crossOrigin = "anonymous";
+      audioEl.loop = true;                  // [Req. 5] reproducción en bucle.
+      audioEl.src = url;
+      audioEl.preload = "auto";
+
+      // MediaElementSource conecta el <audio> al grafo de Web Audio.
+      const source = ctx.createMediaElementSource(audioEl);
+
+      // PannerNode con modelo HRTF para espacialización binaural realista.
+      const panner = ctx.createPanner();
+      panner.panningModel  = "HRTF";
+      panner.distanceModel = "inverse";
+      panner.refDistance   = 1;
+      panner.maxDistance   = CUBE_SIZE * 1.5;
+      panner.rolloffFactor = 1.2;          // atenuación con la distancia.
+      panner.coneInnerAngle = 360;
+      panner.coneOuterAngle = 0;
+      panner.coneOuterGain  = 0;
+
+      // Posición del panner en el espacio (con compatibilidad cross-browser).
+      this._setPannerPosition(panner, x, y, z);
+
+      // GainNode para control de volumen individual del nodo.
+      const gain = ctx.createGain();
+      gain.gain.value = 0.9;
+
+      // Cadena: source -> panner -> gain -> destino.
+      source.connect(panner);
+      panner.connect(gain);
+      gain.connect(ctx.destination);
+
+      return { audioEl, source, panner, gain };
+    },
+
+    // Posiciona el panner de forma compatible (API nueva y obsoleta).
+    _setPannerPosition(panner, x, y, z) {
+      if (panner.positionX) {
+        panner.positionX.value = x;
+        panner.positionY.value = y;
+        panner.positionZ.value = z;
+      } else {
+        panner.setPosition(x, y, z); // navegadores antiguos.
+      }
+    },
+
+    // Actualiza la posición y orientación del listener según la cámara.
+    // Esto es lo que hace que el paneo responda al girar la mirada [Req. 6].
+    updateListener(camera) {
+      if (!this.ready) return;
+      const lis = this.listener;
+      const p = camera.position;
+
+      // Vectores de orientación derivados de la matriz de la cámara.
+      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+      const up      = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion);
+
+      if (lis.positionX) {
+        lis.positionX.value = p.x;
+        lis.positionY.value = p.y;
+        lis.positionZ.value = p.z;
+        lis.forwardX.value = forward.x;
+        lis.forwardY.value = forward.y;
+        lis.forwardZ.value = forward.z;
+        lis.upX.value = up.x;
+        lis.upY.value = up.y;
+        lis.upZ.value = up.z;
+      } else {
+        // API obsoleta (un solo método para posición y orientación).
+        lis.setPosition(p.x, p.y, p.z);
+        lis.setOrientation(forward.x, forward.y, forward.z, up.x, up.y, up.z);
+      }
+    }
+  };
+
+  /* ==========================================================================
+     [E] ESCENA 3D — Three.js
+     ========================================================================== */
+
+  const Scene3D = {
+    scene: null,
+    camera: null,
+    renderer: null,
+
+    init() {
+      const canvas = document.getElementById('scene-canvas');
+
+      // Escena con fondo oscuro rígido [Req. 3].
+      this.scene = new THREE.Scene();
+      this.scene.background = new THREE.Color(0x0a0c10);
+      this.scene.fog = new THREE.Fog(0x0a0c10, 8, 22);
+
+      // Cámara en perspectiva, estática en el centro exacto (0,0,0) [Req. 3].
+      this.camera = new THREE.PerspectiveCamera(
+        70, window.innerWidth / window.innerHeight, 0.1, 100
+      );
+      this.camera.position.set(0, 0, 0);
+
+      // Renderizador. antialias moderado; pixelRatio limitado para gama baja.
+      this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+      this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      this.renderer.setSize(window.innerWidth, window.innerHeight);
+
+      this._buildRoom();
+      this._buildLights();
+
+      window.addEventListener('resize', () => this._onResize());
+    },
+
+    // Cubo wireframe semitransparente que delimita el "salón físico" [Req. 3].
+    _buildRoom() {
+      const geo = new THREE.BoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE);
+
+      // Aristas marcadas del cubo.
+      const edges = new THREE.EdgesGeometry(geo);
+      const lineMat = new THREE.LineBasicMaterial({
+        color: 0x2a4a55, transparent: true, opacity: 0.9
+      });
+      this.scene.add(new THREE.LineSegments(edges, lineMat));
+
+      // Caras semitransparentes muy tenues para dar sensación de volumen.
+      const faceMat = new THREE.MeshBasicMaterial({
+        color: 0x0e2730, transparent: true, opacity: 0.06,
+        side: THREE.BackSide, depthWrite: false
+      });
+      this.scene.add(new THREE.Mesh(geo, faceMat));
+
+      // Rejilla de referencia en el suelo del cubo.
+      const grid = new THREE.GridHelper(CUBE_SIZE, 10, 0x1f3640, 0x16252b);
+      grid.position.y = -HALF;
+      this.scene.add(grid);
+    },
+
+    _buildLights() {
+      this.scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+      const dir = new THREE.DirectionalLight(0xffffff, 0.5);
+      dir.position.set(5, 8, 5);
+      this.scene.add(dir);
+    },
+
+    // Crea el cubo neón que representa visualmente un nodo sonoro [Req. 4].
+    createNodeMesh(x, y, z) {
+      const color = NEON_COLORS[Math.floor(Math.random() * NEON_COLORS.length)];
+      const geo = new THREE.BoxGeometry(0.55, 0.55, 0.55);
+      const mat = new THREE.MeshStandardMaterial({
+        color: color,
+        emissive: color,
+        emissiveIntensity: 0.9,
+        roughness: 0.3,
+        metalness: 0.1
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(x, y, z);
+
+      // Halo wireframe alrededor para darle el look "neón".
+      const halo = new THREE.LineSegments(
+        new THREE.EdgesGeometry(new THREE.BoxGeometry(0.8, 0.8, 0.8)),
+        new THREE.LineBasicMaterial({ color: color, transparent: true, opacity: 0.5 })
+      );
+      mesh.add(halo);
+
+      this.scene.add(mesh);
+      return mesh;
+    },
+
+    // Destruye un mesh y libera su geometría/material (memoria) [Req. 7].
+    destroyNodeMesh(mesh) {
+      this.scene.remove(mesh);
+      mesh.traverse(obj => {
+        if (obj.geometry) obj.geometry.dispose();
+        if (obj.material) obj.material.dispose();
+      });
+    },
+
+    _onResize() {
+      this.camera.aspect = window.innerWidth / window.innerHeight;
+      this.camera.updateProjectionMatrix();
+      this.renderer.setSize(window.innerWidth, window.innerHeight);
+    },
+
+    render() {
+      this.renderer.render(this.scene, this.camera);
+    }
+  };
+
+  /* ==========================================================================
+     [F] CONTROL DE CÁMARA — mirada en primera persona (drag) [Req. 6]
+     --------------------------------------------------------------------------
+     La cámara NO se traslada; solo rota sobre su eje (yaw/pitch), emulando a un
+     usuario quieto en el centro que gira la cabeza. Funciona con mouse y táctil.
+     ========================================================================== */
+
+  const CameraControl = {
+    yaw: 0,            // rotación horizontal (rad).
+    pitch: 0,          // rotación vertical (rad).
+    dragging: false,
+    lastX: 0,
+    lastY: 0,
+    SENS: 0.0045,      // sensibilidad de arrastre.
+    PITCH_LIMIT: Math.PI / 2 - 0.1,
+
+    init(camera) {
+      this.camera = camera;
+      const el = document.getElementById('scene-canvas');
+
+      // --- Eventos de puntero unificados (mouse + táctil) ---
+      const start = (x, y) => { this.dragging = true; this.lastX = x; this.lastY = y; };
+      const move  = (x, y) => {
+        if (!this.dragging) return;
+        const dx = x - this.lastX;
+        const dy = y - this.lastY;
+        this.lastX = x; this.lastY = y;
+
+        this.yaw   -= dx * this.SENS;
+        this.pitch -= dy * this.SENS;
+        // Limita el pitch para no voltear la cámara.
+        this.pitch = Math.max(-this.PITCH_LIMIT, Math.min(this.PITCH_LIMIT, this.pitch));
+      };
+      const end = () => { this.dragging = false; };
+
+      // Mouse.
+      el.addEventListener('mousedown', e => start(e.clientX, e.clientY));
+      window.addEventListener('mousemove', e => move(e.clientX, e.clientY));
+      window.addEventListener('mouseup', end);
+
+      // Táctil.
+      el.addEventListener('touchstart', e => {
+        const t = e.touches[0]; start(t.clientX, t.clientY);
+      }, { passive: true });
+      window.addEventListener('touchmove', e => {
+        const t = e.touches[0]; move(t.clientX, t.clientY);
+      }, { passive: true });
+      window.addEventListener('touchend', end);
+    },
+
+    // Aplica yaw/pitch a la cámara cada frame.
+    update() {
+      const euler = new THREE.Euler(this.pitch, this.yaw, 0, 'YXZ');
+      this.camera.quaternion.setFromEuler(euler);
+    }
+  };
+
+  /* ==========================================================================
+     [G] GESTOR DE NODOS — concurrencia y memoria volátil [Req. 7]
+     --------------------------------------------------------------------------
+     Cola FIFO con tope MAX_NODES. Al inyectar el sexto, destruye el primero
+     por completo: .disconnect() del grafo de audio + remoción del mesh 3D.
+     ========================================================================== */
+
+  const NodeManager = {
+    nodes: [],   // cada entrada: { mesh, audio, name }
+
+    inject(name, url) {
+      if (!AudioEngine.ready) return;
+
+      console.log('[INJECT] Intentando inyectar:', name);
+      console.log('[INJECT] URL:', url.slice(0, 100) + (url.length > 100 ? '...' : ''));
+
+      // Coordenadas aleatorias estrictamente dentro del cubo [Req. 4].
+      const rand = () => (Math.random() * 2 - 1) * (HALF - SPAWN_MARGIN);
+      const x = rand(), y = rand(), z = rand();
+
+      // Construye fuente de audio espacializada.
+      const audio = AudioEngine.createSpatialSource(url, x, y, z);
+      if (!audio) { 
+        console.error('[INJECT] Fallo al crear fuente de audio');
+        UI.setStatus('No se pudo crear la fuente de audio.', 'danger'); 
+        return; 
+      }
+
+      // Construye el cubo neón en la misma coordenada.
+      const mesh = Scene3D.createNodeMesh(x, y, z);
+
+      // Si ya hay 5, destruye el más antiguo ANTES de añadir el nuevo.
+      if (this.nodes.length >= MAX_NODES) {
+        this._destroyOldest();
+      }
+
+      this.nodes.push({ mesh, audio, name });
+
+      // Inicia la reproducción en bucle.
+      audio.audioEl.play().catch(err => {
+        console.error('[INJECT] Error al reproducir:', err.message);
+        UI.setStatus('El navegador bloqueó la reproducción: ' + err.message, 'warn');
+      });
+
+      UI.updateCounter(this.nodes.length);
+    },
+
+    // Destrucción total del nodo más antiguo (FIFO) [Req. 7].
+    _destroyOldest() {
+      const old = this.nodes.shift();
+      if (!old) return;
+      this._destroyNode(old);
+    },
+
+    _destroyNode(node) {
+      // 1) Detener y desconectar el grafo de Web Audio para liberar memoria.
+      try {
+        node.audio.audioEl.pause();
+        node.audio.audioEl.src = "";
+        node.audio.source.disconnect();
+        node.audio.panner.disconnect();
+        node.audio.gain.disconnect();
+      } catch (e) { /* nodo ya desconectado */ }
+
+      // 2) Remover y liberar el mesh de la escena 3D.
+      Scene3D.destroyNodeMesh(node.mesh);
+    },
+
+    // Animación sutil de los nodos cada frame (rotación + pulso de emisión).
+    animate(t) {
+      for (const n of this.nodes) {
+        n.mesh.rotation.x += 0.01;
+        n.mesh.rotation.y += 0.014;
+        const pulse = 0.7 + Math.sin(t * 0.003 + n.mesh.position.x) * 0.4;
+        n.mesh.material.emissiveIntensity = pulse;
+      }
+    }
+  };
+
+  /* ==========================================================================
+     [B] CLIENTE FREESOUND — búsqueda con fallback [Req. 1, 2, 8]
+     ========================================================================== */
+
+  const Freesound = {
+    // Indica si hay token válido (no vacío ni placeholder).
+    hasToken() {
+      return FREESOUND_TOKEN &&
+             FREESOUND_TOKEN.trim() !== '' &&
+             FREESOUND_TOKEN !== 'TU_TOKEN_AQUÍ';
+    },
+
+    // Busca por texto. Devuelve lista normalizada [{ name, previewUrl }].
+    async search(query) {
+      console.log('[FREESOUND] Buscando:', query);
+      
+      // Sin token -> failsafe inmediato [Req. 8].
+      if (!this.hasToken()) {
+        console.warn('[FREESOUND] Sin token válido -> failsafe');
+        UI.setStatus('Sin token: cargando banco failsafe local.', 'warn');
+        return this._failsafeResults();
+      }
+
+      // Pedimos los campos previews para obtener el .mp3 de baja calidad [Req. 2].
+      // La API key simple se pasa como parámetro `token` en la URL (método
+      // documentado por Freesound), no como header Authorization. Esto además
+      // evita complicaciones de CORS con headers personalizados.
+      const params = new URLSearchParams({
+        query: query,
+        fields: 'id,name,previews',
+        page_size: '12',
+        filter: 'duration:[1 TO 30]', // clips cortos, mejores para loops.
+        token: FREESOUND_TOKEN
+      });
+
+      try {
+        const res = await fetch(`${FREESOUND_API}?${params.toString()}`);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+
+        const data = await res.json();
+        if (!data.results || data.results.length === 0) {
+          console.warn('[FREESOUND] Sin resultados');
+          UI.setStatus('Sin resultados para "' + query + '".', 'warn');
+          return [];
+        }
+
+        console.log('[FREESOUND] Recibidos', data.results.length, 'resultados');
+        
+        // Normaliza: usamos el preview LQ en mp3 [Req. 2 y 5].
+        const normalized = data.results
+          .filter(r => r.previews && r.previews['preview-lq-mp3'])
+          .map(r => ({
+            name: r.name,
+            previewUrl: r.previews['preview-lq-mp3']
+          }));
+        
+        console.log('[FREESOUND] Normalizados', normalized.length, 'con previews válidos');
+        return normalized;
+
+      } catch (err) {
+        // Fallo de red / CORS / auth -> failsafe [Req. 8].
+        console.error('[FREESOUND] Error en búsqueda:', err.message, '-> failsafe');
+        UI.setStatus('Fallo de red (' + err.message + '). Usando banco failsafe.', 'warn');
+        return this._failsafeResults();
+      }
+    },
+
+    _failsafeResults() {
+      return FAILSAFE_BANK.map(s => ({ name: '[LOCAL] ' + s.name, previewUrl: s.url }));
+    }
+  };
+
+  /* ==========================================================================
+     [C] CAPA DE INTERFAZ — render de lista y flujo Preview & Inject [Req. 2]
+     ========================================================================== */
+
+  const UI = {
+    previewAudio: null,    // elemento <audio> de la preescucha activa.
+    previewBtn: null,      // botón actualmente en estado "playing".
+
+    init() {
+      this.resultsZone = document.getElementById('results-zone');
+      this.searchBtn   = document.getElementById('search-btn');
+      this.searchInput = document.getElementById('search-input');
+      this.counter     = document.getElementById('node-counter');
+
+      // Indicador de estado del token.
+      const ts = document.getElementById('token-status');
+      if (Freesound.hasToken()) {
+        ts.textContent = '● Token: detectado'; ts.className = 'token-status ok';
+      } else {
+        ts.textContent = '● Token: vacío → modo failsafe'; ts.className = 'token-status warn';
+      }
+
+      // Eventos de búsqueda.
+      this.searchBtn.addEventListener('click', () => this.runSearch());
+      this.searchInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter') this.runSearch();
+      });
+    },
+
+    async runSearch() {
+      const q = this.searchInput.value.trim();
+      if (!q) { this.setStatus('Escribe un término de búsqueda.', 'warn'); return; }
+
+      this.stopPreview();
+      this.searchBtn.disabled = true;
+      this.setStatus('Buscando "' + q + '"…', 'dim');
+
+      const results = await Freesound.search(q);
+      this.searchBtn.disabled = false;
+
+      this.renderResults(results);
+    },
+
+    // Pinta la lista. NO siembra nada automáticamente [Req. 2].
+    renderResults(results) {
+      this.resultsZone.innerHTML = '';
+
+      if (!results || results.length === 0) {
+        this.setStatus('No hay resultados que mostrar.', 'warn');
+        return;
+      }
+
+      results.forEach(item => {
+        const el = document.createElement('div');
+        el.className = 'result-item';
+
+        const title = document.createElement('div');
+        title.className = 'result-title';
+        title.textContent = item.name;
+
+        const meta = document.createElement('div');
+        meta.className = 'result-meta';
+        meta.textContent = 'preview .mp3 (LQ)';
+
+        const actions = document.createElement('div');
+        actions.className = 'result-actions';
+
+        // --- Botón Preescuchar (estéreo plano, con pausa) [Req. 2] ---
+        const previewBtn = document.createElement('button');
+        previewBtn.className = 'btn-preview';
+        previewBtn.textContent = '▶ Preescuchar';
+        previewBtn.addEventListener('click', () => this.togglePreview(item.previewUrl, previewBtn));
+
+        // --- Botón Inyectar Sonido [Req. 2] ---
+        const injectBtn = document.createElement('button');
+        injectBtn.className = 'btn-inject';
+        injectBtn.textContent = '✦ Inyectar';
+        injectBtn.addEventListener('click', () => {
+          this.stopPreview();                 // detiene preescucha.
+          NodeManager.inject(item.name, item.previewUrl); // dispara espacialización.
+          this.removeItem(el);                // remueve de la lista.
+        });
+
+        actions.appendChild(previewBtn);
+        actions.appendChild(injectBtn);
+        el.appendChild(title);
+        el.appendChild(meta);
+        el.appendChild(actions);
+        this.resultsZone.appendChild(el);
+      });
+    },
+
+    // Preescucha simple en estéreo plano (NO espacializada) [Req. 2].
+    togglePreview(url, btn) {
+      // Si pulso el mismo que suena -> pausar.
+      if (this.previewBtn === btn && this.previewAudio && !this.previewAudio.paused) {
+        this.stopPreview();
+        return;
+      }
+      this.stopPreview();
+
+      const audio = new Audio();
+      // La preescucha solo reproduce el audio tal cual (no lo analiza ni
+      // espacializa), por lo que NO necesita crossOrigin. Omitirlo evita
+      // bloqueos innecesarios con previews remotos.
+      audio.src = url;
+      audio.play().catch(err => this.setStatus('No se pudo preescuchar: ' + err.message, 'warn'));
+      audio.addEventListener('ended', () => this.stopPreview());
+
+      this.previewAudio = audio;
+      this.previewBtn = btn;
+      btn.classList.add('playing');
+      btn.textContent = '⏸ Pausar';
+    },
+
+    stopPreview() {
+      if (this.previewAudio) {
+        this.previewAudio.pause();
+        this.previewAudio.src = "";
+        this.previewAudio = null;
+      }
+      if (this.previewBtn) {
+        this.previewBtn.classList.remove('playing');
+        this.previewBtn.textContent = '▶ Preescuchar';
+        this.previewBtn = null;
+      }
+    },
+
+    // Remueve el elemento de la lista con una pequeña animación [Req. 2].
+    removeItem(el) {
+      el.classList.add('removing');
+      setTimeout(() => el.remove(), 200);
+    },
+
+    updateCounter(n) {
+      this.counter.textContent = n + ' / ' + MAX_NODES;
+    },
+
+    setStatus(msg, kind) {
+      const colors = { dim: 'var(--txt-dim)', warn: 'var(--warn)', danger: 'var(--danger)', ok: 'var(--ok)' };
+      this.resultsZone.innerHTML =
+        '<div class="status-line" style="color:' + (colors[kind] || 'var(--txt-dim)') + '">' + msg + '</div>';
+    }
+  };
+
+  /* ==========================================================================
+     BUCLE PRINCIPAL Y ARRANQUE
+     ========================================================================== */
+
+  function animate(t) {
+    requestAnimationFrame(animate);
+    CameraControl.update();              // [F] aplica la mirada.
+    AudioEngine.updateListener(Scene3D.camera); // [D] sincroniza listener -> paneo en vivo.
+    NodeManager.animate(t);              // [G] anima los nodos neón.
+    Scene3D.render();                    // [E] dibuja el frame.
+  }
+
+  // Inicializa la parte visual de inmediato (no requiere gesto del usuario).
+  function bootVisual() {
+    SynthBank.build();        // genera los ambientes sintéticos del failsafe.
+    Scene3D.init();
+    CameraControl.init(Scene3D.camera);
+    UI.init();
+    requestAnimationFrame(animate);
+  }
+
+  // Inicializa el audio SOLO tras el gesto del usuario (política de autoplay).
+  function bootAudio() {
+    AudioEngine.init();
+    // Reanuda el contexto si el navegador lo crea en estado "suspended".
+    if (AudioEngine.ctx.state === 'suspended') AudioEngine.ctx.resume();
+    document.getElementById('audio-gate').style.display = 'none';
+  }
+
+  // Arranque.
+  window.addEventListener('DOMContentLoaded', () => {
+    bootVisual();
+    document.getElementById('audio-gate').addEventListener('click', bootAudio, { once: true });
+  });
+
+  </script>
+</body>
+</html>
